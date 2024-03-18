@@ -62,8 +62,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("EphemeralRunnerSetNamespace '%s' or EphemeralRunnerSetName '%s' is missing", c.EphemeralRunnerSetNamespace, c.EphemeralRunnerSetName)
 	}
 
-	if c.RunnerScaleSetId == 0 {
-		return fmt.Errorf("RunnerScaleSetId '%d' is missing", c.RunnerScaleSetId)
+	if c.RunnerScaleSetName == "" {
+		return fmt.Errorf("RunnerScaleSetName '%s' is missing", c.RunnerScaleSetName)
 	}
 
 	if c.MaxRunners < c.MinRunners {

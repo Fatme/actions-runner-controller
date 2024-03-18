@@ -36,23 +36,26 @@ type Client interface {
 	AcquireJobs(ctx context.Context, runnerScaleSetId int, messageQueueAccessToken string, requestIds []int64) ([]int64, error)
 	RefreshMessageSession(ctx context.Context, runnerScaleSetId int, sessionId *uuid.UUID) (*actions.RunnerScaleSetSession, error)
 	DeleteMessageSession(ctx context.Context, runnerScaleSetId int, sessionId *uuid.UUID) error
+	CreateRunnerScaleSet(ctx context.Context, runnerScaleSet *actions.RunnerScaleSet) (*actions.RunnerScaleSet, error)
+	DeleteRunnerScaleSet(ctx context.Context, runnerScaleSetId int) error
+	GetRunnerScaleSet(ctx context.Context, runnerGroupId int, runnerName string) (*actions.RunnerScaleSet, error)
 }
 
 type Config struct {
-	Client     Client
-	ScaleSetID int
-	MinRunners int
-	MaxRunners int
-	Logger     logr.Logger
-	Metrics    metrics.Publisher
+	Client       Client
+	ScaleSetName string
+	MinRunners   int
+	MaxRunners   int
+	Logger       logr.Logger
+	Metrics      metrics.Publisher
 }
 
 func (c *Config) Validate() error {
 	if c.Client == nil {
 		return errors.New("client is required")
 	}
-	if c.ScaleSetID == 0 {
-		return errors.New("scaleSetID is required")
+	if c.ScaleSetName == "" {
+		return errors.New("scaleSetName is required")
 	}
 	if c.MinRunners < 0 {
 		return errors.New("minRunners must be greater than or equal to 0")
@@ -70,9 +73,9 @@ func (c *Config) Validate() error {
 // It receives messages and processes them using the given handler.
 type Listener struct {
 	// configured fields
-	scaleSetID int               // The ID of the scale set associated with the listener.
-	client     Client            // The client used to interact with the scale set.
-	metrics    metrics.Publisher // The publisher used to publish metrics.
+	scaleSetName string            // The name of the scale set associated with the listener.
+	client       Client            // The client used to interact with the scale set.
+	metrics      metrics.Publisher // The publisher used to publish metrics.
 
 	// internal fields
 	logger   logr.Logger // The logger used for logging.
@@ -89,10 +92,10 @@ func New(config Config) (*Listener, error) {
 	}
 
 	listener := &Listener{
-		scaleSetID: config.ScaleSetID,
-		client:     config.Client,
-		logger:     config.Logger,
-		metrics:    metrics.Discard,
+		client:       config.Client,
+		logger:       config.Logger,
+		metrics:      metrics.Discard,
+		scaleSetName: config.ScaleSetName,
 	}
 
 	if config.Metrics != nil {
@@ -123,13 +126,29 @@ type Handler interface {
 // The handler is responsible for handling the initial message and subsequent messages.
 // If an error occurs during any step, Listen returns an error.
 func (l *Listener) Listen(ctx context.Context, handler Handler) error {
-	if err := l.createSession(ctx); err != nil {
+	runnerScaleSet, err := l.client.GetRunnerScaleSet(ctx, 1, l.scaleSetName)
+	if runnerScaleSet != nil {
+		l.deleteRunnerScaleSet(ctx, runnerScaleSet.Id)
+	}
+
+	runnerScaleSet, err = l.createRunnerScaleSet(ctx, l.scaleSetName)
+	if err != nil {
+		return fmt.Errorf("createRunnerScaleSet failed: %w", err)
+	}
+
+	l.logger.Info("Successfully created runnerScaleSet with ID", "ID", runnerScaleSet.Id)
+
+	if err := l.createSession(ctx, runnerScaleSet.Id); err != nil {
 		return fmt.Errorf("createSession failed: %w", err)
 	}
 
 	defer func() {
 		if err := l.deleteMessageSession(); err != nil {
 			l.logger.Error(err, "failed to delete message session")
+		}
+
+		if err := l.deleteRunnerScaleSet(ctx, runnerScaleSet.Id); err != nil {
+			l.logger.Error(err, "failed to delete runnerScaleSet")
 		}
 	}()
 
@@ -168,21 +187,21 @@ func (l *Listener) Listen(ctx context.Context, handler Handler) error {
 		}
 
 		// New context is created to avoid cancelation during message handling.
-		if err := l.handleMessage(context.Background(), handler, msg); err != nil {
+		if err := l.handleMessage(context.Background(), handler, msg, runnerScaleSet.Id); err != nil {
 			return fmt.Errorf("failed to handle message: %w", err)
 		}
 	}
 }
 
-func (l *Listener) handleMessage(ctx context.Context, handler Handler, msg *actions.RunnerScaleSetMessage) error {
-	parsedMsg, err := l.parseMessage(ctx, msg)
+func (l *Listener) handleMessage(ctx context.Context, handler Handler, msg *actions.RunnerScaleSetMessage, scaleSetID int) error {
+	parsedMsg, err := l.parseMessage(ctx, msg, scaleSetID)
 	if err != nil {
 		return fmt.Errorf("failed to parse message: %w", err)
 	}
 	l.metrics.PublishStatistics(parsedMsg.statistics)
 
 	if len(parsedMsg.jobsAvailable) > 0 {
-		acquiredJobIDs, err := l.acquireAvailableJobs(ctx, parsedMsg.jobsAvailable)
+		acquiredJobIDs, err := l.acquireAvailableJobs(ctx, parsedMsg.jobsAvailable, scaleSetID)
 		if err != nil {
 			return fmt.Errorf("failed to acquire jobs: %w", err)
 		}
@@ -215,13 +234,40 @@ func (l *Listener) handleMessage(ctx context.Context, handler Handler, msg *acti
 	return nil
 }
 
-func (l *Listener) createSession(ctx context.Context) error {
+func (l *Listener) createRunnerScaleSet(ctx context.Context, name string) (*actions.RunnerScaleSet, error) {
+	runnerScaleSet, err := l.client.CreateRunnerScaleSet(ctx, &actions.RunnerScaleSet{
+		Name:          name,
+		RunnerGroupId: 1,
+		Labels: []actions.Label{
+			{
+				Name: name,
+				Type: "System",
+			},
+		},
+		RunnerSetting: actions.RunnerSetting{
+			Ephemeral:     true,
+			DisableUpdate: true,
+		},
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return runnerScaleSet, nil
+}
+
+func (l *Listener) deleteRunnerScaleSet(ctx context.Context, runnerScaleSetId int) error {
+	return l.client.DeleteRunnerScaleSet(ctx, runnerScaleSetId)
+}
+
+func (l *Listener) createSession(ctx context.Context, scaleSetID int) error {
 	var session *actions.RunnerScaleSetSession
 	var retries int
 
 	for {
 		var err error
-		session, err = l.client.CreateMessageSession(ctx, l.scaleSetID, l.hostname)
+		session, err = l.client.CreateMessageSession(ctx, scaleSetID, l.hostname)
 		if err == nil {
 			break
 		}
@@ -303,7 +349,7 @@ type parsedMessage struct {
 	jobsCompleted []*actions.JobCompleted
 }
 
-func (l *Listener) parseMessage(ctx context.Context, msg *actions.RunnerScaleSetMessage) (*parsedMessage, error) {
+func (l *Listener) parseMessage(ctx context.Context, msg *actions.RunnerScaleSetMessage, scaleSetID int) (*parsedMessage, error) {
 	if msg.MessageType != "RunnerScaleSetJobMessages" {
 		l.logger.Info("Skipping message", "messageType", msg.MessageType)
 		return nil, fmt.Errorf("invalid message type: %s", msg.MessageType)
@@ -376,7 +422,7 @@ func (l *Listener) parseMessage(ctx context.Context, msg *actions.RunnerScaleSet
 	return parsedMsg, nil
 }
 
-func (l *Listener) acquireAvailableJobs(ctx context.Context, jobsAvailable []*actions.JobAvailable) ([]int64, error) {
+func (l *Listener) acquireAvailableJobs(ctx context.Context, jobsAvailable []*actions.JobAvailable, scaleSetID int) ([]int64, error) {
 	ids := make([]int64, 0, len(jobsAvailable))
 	for _, job := range jobsAvailable {
 		ids = append(ids, job.RunnerRequestId)
@@ -384,7 +430,7 @@ func (l *Listener) acquireAvailableJobs(ctx context.Context, jobsAvailable []*ac
 
 	l.logger.Info("Acquiring jobs", "count", len(ids), "requestIds", fmt.Sprint(ids))
 
-	idsAcquired, err := l.client.AcquireJobs(ctx, l.scaleSetID, l.session.MessageQueueAccessToken, ids)
+	idsAcquired, err := l.client.AcquireJobs(ctx, scaleSetID, l.session.MessageQueueAccessToken, ids)
 	if err == nil { // if NO errors
 		return idsAcquired, nil
 	}
@@ -398,7 +444,7 @@ func (l *Listener) acquireAvailableJobs(ctx context.Context, jobsAvailable []*ac
 		return nil, err
 	}
 
-	idsAcquired, err = l.client.AcquireJobs(ctx, l.scaleSetID, l.session.MessageQueueAccessToken, ids)
+	idsAcquired, err = l.client.AcquireJobs(ctx, scaleSetID, l.session.MessageQueueAccessToken, ids)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire jobs after session refresh: %w", err)
 	}

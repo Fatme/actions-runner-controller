@@ -87,12 +87,12 @@ func New(config config.Config) (*App, error) {
 	app.worker = worker
 
 	listener, err := listener.New(listener.Config{
-		Client:     actionsClient,
-		ScaleSetID: app.config.RunnerScaleSetId,
-		MinRunners: app.config.MinRunners,
-		MaxRunners: app.config.MaxRunners,
-		Logger:     app.logger.WithName("listener"),
-		Metrics:    app.metrics,
+		Client:       actionsClient,
+		ScaleSetName: app.config.RunnerScaleSetName,
+		MinRunners:   app.config.MinRunners,
+		MaxRunners:   app.config.MaxRunners,
+		Logger:       app.logger.WithName("listener"),
+		Metrics:      app.metrics,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new listener: %w", err)
